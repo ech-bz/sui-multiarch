@@ -14,6 +14,58 @@ env:
   IMAGE_TAG: ${{ github.event.inputs.tag }}
 
 jobs:
+  build-amd64:
+    name: Build ${{ matrix.image }} (amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image:
+          - sui-node
+          - sui-tools
+          - sui-indexer-alt
+          - sui-indexer-alt-graphql
+          - sui-checkpoint-blob-indexer
+    steps:
+      - name: Check if amd64 image exists on Docker Hub
+        id: check
+        run: |
+          HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+            "https://hub.docker.com/v2/repositories/mysten/${{ matrix.image }}/tags/${{ env.IMAGE_TAG }}/" || echo "404")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "SKIP: mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }} exists on Docker Hub"
+            echo "EXISTS=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "BUILD: mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }} not found (HTTP ${HTTP_CODE})"
+            echo "EXISTS=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        if: steps.check.outputs.EXISTS == 'false'
+        with:
+          fetch-depth: 0
+
+      - name: Log in to Container Registry
+        if: steps.check.outputs.EXISTS == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.image }} (amd64)
+        if: steps.check.outputs.EXISTS == 'false'
+        run: |
+          docker build -f ./docker/${{ matrix.image }}/Dockerfile \
+            --platform linux/amd64 \
+            --build-arg GIT_REVISION=${{ env.IMAGE_TAG }} \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%d') \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}-amd64 \
+            .
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}-amd64
+
   build-arm64:
     name: Build ${{ matrix.image }} (arm64)
     runs-on: ubuntu-24.04-arm
@@ -29,11 +81,26 @@ jobs:
           - sui-indexer-alt-graphql
           - sui-checkpoint-blob-indexer
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+      - name: Check if arm64 image exists on Docker Hub
+        id: check
+        run: |
+          HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+            "https://hub.docker.com/v2/repositories/mysten/${{ matrix.image }}/tags/${{ env.IMAGE_TAG }}-arm64/" || echo "404")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "SKIP: mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }}-arm64 exists on Docker Hub"
+            echo "EXISTS=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "BUILD: mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }}-arm64 not found (HTTP ${HTTP_CODE})"
+            echo "EXISTS=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        if: steps.check.outputs.EXISTS == 'false'
         with:
           fetch-depth: 0
 
       - name: Log in to Container Registry
+        if: steps.check.outputs.EXISTS == 'false'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -41,6 +108,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push ${{ matrix.image }} (arm64)
+        if: steps.check.outputs.EXISTS == 'false'
         run: |
           docker build -f ./docker/${{ matrix.image }}/Dockerfile \
             --build-arg GIT_REVISION=${{ env.IMAGE_TAG }} \
@@ -51,7 +119,8 @@ jobs:
 
   create-manifests:
     name: Create manifest for ${{ matrix.image }}
-    needs: [build-arm64]
+    needs: [build-amd64, build-arm64]
+    if: always() && !failure() && !cancelled()
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -73,7 +142,23 @@ jobs:
 
       - name: Create manifest for ${{ matrix.image }}
         run: |
+          AMD64_SRC="${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}-amd64"
+          ARM64_SRC="${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}-arm64"
+
+          if ! docker manifest inspect "${AMD64_SRC}" >/dev/null 2>&1; then
+            echo "GHCR amd64 not found, falling back to Docker Hub"
+            AMD64_SRC="mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }}"
+          fi
+          if ! docker manifest inspect "${ARM64_SRC}" >/dev/null 2>&1; then
+            echo "GHCR arm64 not found, falling back to Docker Hub"
+            ARM64_SRC="mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }}-arm64"
+          fi
+
+          echo "Creating multi-arch manifest from:"
+          echo "  amd64: ${AMD64_SRC}"
+          echo "  arm64: ${ARM64_SRC}"
+
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }} \
-            mysten/${{ matrix.image }}:${{ env.IMAGE_TAG }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_BASE }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}-arm64
+            "${AMD64_SRC}" \
+            "${ARM64_SRC}"
